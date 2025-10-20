@@ -230,7 +230,7 @@ impl GPTBase {
         &self,
         input_ids: &Array2<f32>,
         past: Option<Vec<(Array4<f32>, Array4<f32>)>>,
-    ) -> Result<(Array3<f32>, Vec<(Array4<f32>, Array4<f32>))> {
+    ) -> Result<(Array3<f32>, Vec<(Array4<f32>, Array4<f32>)>)> {
         let (batch_size, seq_len) = input_ids.dim();
         
         // Token embeddings
@@ -246,7 +246,8 @@ impl GPTBase {
         let past_len = past.as_ref().map(|p| p[0].0.shape()[2]).unwrap_or(0);
         for j in 0..seq_len {
             let pos = past_len + j;
-            hidden.slice_mut(s![.., j, ..]).add_assign(&self.wpe.row(pos));
+            let mut slice = hidden.slice_mut(s![.., j, ..]);
+            slice += &self.wpe.row(pos);
         }
         
         // Pass through transformer blocks
