@@ -4,7 +4,7 @@ use crate::config::BartConfig;
 use crate::ModelWeights;
 use anyhow::Result;
 use edgetransformers::{Embeddings, FeedForward, LayerNorm, MultiHeadAttention, TransformerConfig};
-use ndarray::{s, Array2, Array3, Axis};
+use ndarray::{s, Array2, Array3, Array4, Axis};
 
 #[cfg(not(target_arch = "wasm32"))]
 use tokenizers::Tokenizer;
@@ -29,9 +29,9 @@ impl BartEncoderLayer {
     ) -> Result<Array3<f32>> {
         // --- Self-Attention Block (Post-Norm) ---
         let residual = hidden_states;
-        let attn_output = self
-            .self_attn
-            .forward_bart(hidden_states, None, Some(attention_mask), false)?;
+        let (attn_output,  _) =
+            self.self_attn
+                .forward_bart(hidden_states, None, Some(attention_mask), false, None)?;
         let mut hidden_states = residual + &attn_output;
         hidden_states = self.self_attn_layer_norm.forward_3d(&hidden_states);
 
@@ -53,15 +53,15 @@ fn create_encoder_attention_mask(attention_mask: &Array2<f32>) -> Array2<f32> {
 /// Create BART decoder causal mask (lower triangular)
 fn create_decoder_causal_mask(seq_len: usize) -> Array2<f32> {
     let mut mask = Array2::<f32>::zeros((seq_len, seq_len));
-    
+
     // Lower triangular: 1 = can attend, 0 = cannot attend
     for i in 0..seq_len {
         for j in 0..=i {
-            mask[[i, j]] = 1.0;  // Can attend to past and current
+            mask[[i, j]] = 1.0; // Can attend to past and current
         }
     }
     // Upper triangle stays 0 (cannot attend to future)
-    
+
     mask
 }
 pub struct BartEncoder {
@@ -90,49 +90,54 @@ pub struct BartDecoderLayer {
     ffn: FeedForward,
     ffn_layer_norm: LayerNorm,
 }
+type LayerCache = (Array4<f32>, Array4<f32>);
+// The full cache for the decoder is a Vec of these LayerCaches.
+type FullCache = Vec<LayerCache>;
 
 impl BartDecoderLayer {
         pub fn forward(
         &self,
         hidden_states: &Array3<f32>,
         encoder_hidden_states: &Array3<f32>,
+        // --- THE FIX: Add the causal mask back to the signature ---
         decoder_causal_mask: Option<&Array2<f32>>,
         encoder_attention_mask: &Array2<f32>,
-    ) -> Result<Array3<f32>> {
-        
-        // Self-Attention
+        layer_past: Option<&LayerCache>,
+    ) -> Result<(Array3<f32>, LayerCache)> {
+        // --- Self-Attention Block ---
         let residual = hidden_states;
-        let self_attn_output = self.self_attn.forward_bart(
-            hidden_states, 
-            None, 
-            decoder_causal_mask,
-            true
+        
+        // --- THE FIX: Pass the causal mask down to the self-attention block ---
+        let (self_attn_output, present_self_attn_kv) = self.self_attn.forward_bart(
+            hidden_states,
+            None,
+            decoder_causal_mask, // <-- Pass the mask here
+            true, // is_causal
+            layer_past,
         )?;
         
         let mut hidden_states = residual + &self_attn_output;
-        
         hidden_states = self.self_attn_layer_norm.forward_3d(&hidden_states);
 
-        // Cross-Attention
+        // --- Cross-Attention Block (remains the same) ---
         let residual = &hidden_states;
-        let cross_attn_output = self.cross_attn.forward_bart(
+        let (cross_attn_output, _) = self.cross_attn.forward_bart(
             &hidden_states,
             Some(encoder_hidden_states),
             Some(encoder_attention_mask),
-            false
+            false, // not causal
+            None, // No cache for cross-attention
         )?;
-        
         hidden_states = residual + &cross_attn_output;
-        
         hidden_states = self.cross_attn_layer_norm.forward_3d(&hidden_states);
-        // FFN
+
+        // --- Feed-Forward Block (remains the same) ---
         let residual = &hidden_states;
         let ffn_output = self.ffn.forward(&hidden_states)?;
-        
         hidden_states = residual + &ffn_output;
         hidden_states = self.ffn_layer_norm.forward_3d(&hidden_states);
 
-        Ok(hidden_states)
+        Ok((hidden_states, present_self_attn_kv))
     }
 }
 
@@ -145,18 +150,29 @@ impl BartDecoder {
         &self,
         mut hidden_states: Array3<f32>,
         encoder_hidden_states: &Array3<f32>,
+        // --- THE FIX: Add the causal mask back to the signature ---
         decoder_causal_mask: Option<&Array2<f32>>,
         encoder_attention_mask: &Array2<f32>,
-    ) -> Result<Array3<f32>> {
-        for layer in &self.layers {
-            hidden_states = layer.forward(
+        past_cache: Option<&FullCache>,
+    ) -> Result<(Array3<f32>, FullCache)> {
+        let mut present_cache = Vec::with_capacity(self.layers.len());
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let layer_past = past_cache.map(|cache| &cache[i]);
+
+            // --- THE FIX: Pass the causal mask down to the layer's forward call ---
+            let (new_hidden_states, new_layer_cache) = layer.forward(
                 &hidden_states,
                 encoder_hidden_states,
-                decoder_causal_mask,
+                decoder_causal_mask, // <-- Pass the mask here
                 encoder_attention_mask,
+                layer_past,
             )?;
+
+            hidden_states = new_hidden_states;
+            present_cache.push(new_layer_cache);
         }
-        Ok(hidden_states)
+        Ok((hidden_states, present_cache))
     }
 }
 
@@ -231,7 +247,19 @@ impl BartModel {
                     .t()
                     .to_owned(),
                 weights.get_array1(&format!("{}.self_attn.out_proj.bias", prefix))?,
+
+
+                
             );
+            let q_proj_weight = weights.get_array2("model.encoder.layers.0.self_attn.q_proj.weight")?.t().to_owned();
+println!("RUST Encoder Layer 0 Q-Proj Weight Sum: {}", q_proj_weight.sum());
+
+let fc1_bias = weights.get_array1("model.encoder.layers.0.fc1.bias")?;
+println!("RUST Encoder Layer 0 FC1 Bias Sum: {}", fc1_bias.sum());
+
+// In your from_weights function, inside the decoder loop for i = 0
+let v_proj_weight_cross = weights.get_array2("model.decoder.layers.0.encoder_attn.v_proj.weight")?.t().to_owned();
+println!("RUST Decoder Layer 0 Cross-Attn V-Proj Weight Sum: {}", v_proj_weight_cross.sum());
             let self_attn_layer_norm = LayerNorm::new(
                 weights.get_array1(&format!("{}.self_attn_layer_norm.weight", prefix))?,
                 weights.get_array1(&format!("{}.self_attn_layer_norm.bias", prefix))?,
@@ -367,10 +395,12 @@ impl BartModel {
         })
     }
 
-    pub fn embed(&self, input_ids: &Array2<f32>, is_decoder: bool) -> Array3<f32> {
+    pub fn embed(&self, input_ids: &Array2<f32>, is_decoder: bool, past_len: usize) -> Array3<f32> {
         let (batch_size, seq_len) = input_ids.dim();
-        // todo: 
-        let embed_scale = if self.config.scale_embedding {
+        // todo:
+        let use_scaling = self.config.scale_embedding || self.config.normalize_embedding;
+
+        let embed_scale = if use_scaling {
             (self.config.d_model as f32).sqrt()
         } else {
             1.0
@@ -379,9 +409,12 @@ impl BartModel {
         for i in 0..batch_size {
             for j in 0..seq_len {
                 let token_id = input_ids[[i, j]] as usize;
-                hidden
-                    .slice_mut(s![i, j, ..])
-                    .assign(&self.shared_embeddings.row(token_id));
+                let mut embedding_row = self.shared_embeddings.row(token_id).to_owned();
+
+                // Apply the scaling factor to the word embeddings
+                embedding_row *= embed_scale;
+
+                hidden.slice_mut(s![i, j, ..]).assign(&embedding_row);
             }
         }
 
@@ -392,12 +425,14 @@ impl BartModel {
             (&self.encoder_pos_embeddings, &self.encoder_embed_layer_norm)
         };
 
+        let start_idx = past_len + 2; // Add the BART offset
+        let end_idx = past_len + seq_len + 2;
+
         let pos_embeddings_slice = pos_embeddings
-            .slice(s![2..seq_len + 2, ..])
+            .slice(s![start_idx..end_idx, ..]) // Use the new start and end indices
             .insert_axis(Axis(0));
         hidden += &pos_embeddings_slice;
 
-        // Apply the correct LayerNorm depending on whether we're in the encoder or decoder
         layer_norm.forward_3d(&hidden)
     }
 }

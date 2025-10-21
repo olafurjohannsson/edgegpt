@@ -12,7 +12,12 @@ torch.set_printoptions(precision=6, sci_mode=False, linewidth=120)
 tokenizer = BartTokenizer.from_pretrained(model_id)
 model = BartForConditionalGeneration.from_pretrained(model_id)
 model.eval() # Set to evaluation mode
-
+print("\n--- WEIGHT CHECKSUMS ---")
+print("Encoder Layer 0 Q-Proj Weight Sum:", model.model.encoder.layers[0].self_attn.q_proj.weight.sum())
+print("Encoder Layer 0 FC1 Bias Sum:", model.model.encoder.layers[0].fc1.bias.sum())
+print("Decoder Layer 0 Cross-Attn V-Proj Weight Sum:", model.model.decoder.layers[0].encoder_attn.v_proj.weight.sum())
+print("First Q-Proj Weight:", model.model.encoder.layers[0].self_attn.q_proj.weight[0, 0])
+print("-" * 20)
 print("--- 1. INPUT ---")
 inputs = tokenizer(article_text, return_tensors="pt")
 input_ids = inputs["input_ids"]

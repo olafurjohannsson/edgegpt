@@ -71,6 +71,8 @@ pub struct BartConfig {
     #[serde(default)]
     pub decoder_start_token_id: u32,
     pub scale_embedding: bool,
+    #[serde(default)]
+    pub normalize_embedding: bool,
 }
 
 fn default_layer_norm_epsilon() -> f32 { 1e-5 }
