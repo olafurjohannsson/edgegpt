@@ -18,9 +18,9 @@ fn main() -> Result<()> {
     let config = GenerationConfig {
     max_new_tokens: 60,
     temperature: 1.0,        // Higher temperature for more diversity
-    top_k: Some(50),
-    top_p: Some(0.95),       // Nucleus sampling
-    repetition_penalty: 1.5, // Stronger penalty against repetition
+    top_k: Some(1),
+    top_p: Some(0.9),       // Nucleus sampling
+    repetition_penalty: 1.2, // Stronger penalty against repetition
     sampling_strategy: edgegpt::SamplingStrategy::TopKTopP,
     ..Default::default()
     };

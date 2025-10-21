@@ -41,6 +41,19 @@ impl Default for GenerationConfig {
     }
 }
 
+type LayerCache = (Array4<f32>, Array4<f32>);
+// The full cache for the decoder is a Vec of these self-attention caches.
+type FullCache = Vec<LayerCache>;
+#[derive(Clone)]
+struct BeamHypothesis {
+    /// The sequence of tokens generated so far.
+    tokens: Vec<u32>,
+    /// The cumulative log probability of this sequence.
+    score: f32,
+    /// The KV cache for this specific beam.
+    cache: Option<FullCache>,
+}
+
 /// Sampling strategies for generation
 #[derive(Clone, Debug)]
 pub enum SamplingStrategy {
@@ -165,61 +178,278 @@ pub fn generate_text(
         Box::new(|_, _| true), // Always continue
     )
 }
-type LayerCache = (Array4<f32>, Array4<f32>);
-// The full cache for the decoder is a Vec of these self-attention caches.
-type FullCache = Vec<LayerCache>;
+
 pub fn generate_encoder_decoder(
     model: &BartModel,
     tokenizer: &Tokenizer,
     prompt: &str,
     config: &GenerationConfig,
 ) -> Result<String> {
-    println!("generate_encoder_decoder");
+    println!("generate_encoder_decoder with Beam Search");
+
+    let num_beams = 2; // You set this to 2, which is good
+    let min_length = 56;
+    let max_length = config.max_new_tokens;
+    let eos_token_id = model.config.eos_token_id;
+    let length_penalty = 1.0; // Standard value, you can tune this
+
+    // --- Encoder Pass (This part is correct now) ---
     let input_encoding = tokenizer
         .encode(prompt, false)
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-
-    let min_length = 56; // TODO: from config
-
-    // --- 1. Encoder Setup (This part is correct) ---
     let mut input_ids_vec = Vec::with_capacity(input_encoding.len() + 2);
     input_ids_vec.push(model.config.bos_token_id);
     input_ids_vec.extend(input_encoding.get_ids());
-    input_ids_vec.push(model.config.eos_token_id);
-    let attention_mask_vec = vec![1; input_ids_vec.len()];
+    input_ids_vec.push(eos_token_id);
     let mut input_ids_array = Array2::<f32>::zeros((1, input_ids_vec.len()));
-    let mut encoder_mask_array = Array2::<f32>::zeros((1, input_ids_vec.len()));
     for (j, &id) in input_ids_vec.iter().enumerate() {
         input_ids_array[[0, j]] = id as f32;
     }
-    for (j, &mask_val) in attention_mask_vec.iter().enumerate() {
-        encoder_mask_array[[0, j]] = mask_val as f32;
-    }
-
-    // --- 2. Encode Once (This part is correct) ---
+    let encoder_mask_array = Array2::<f32>::ones((1, input_ids_vec.len()));
     let encoder_embeddings = model.embed(&input_ids_array, false, 0);
     let encoder_hidden_states = model
         .encoder
         .forward(encoder_embeddings, &encoder_mask_array)?;
 
-    // --- 3. Decoder and Loop Setup ---
+    // --- Initialize Beams (This part is correct now) ---
+    let mut beams: Vec<BeamHypothesis> = vec![BeamHypothesis {
+        tokens: vec![model.config.bos_token_id],
+        score: 0.0,
+        cache: None,
+    }];
+    let mut completed_beams: Vec<BeamHypothesis> = Vec::new();
+
+    // --- Beam Search Loop ---
+    for _ in 0..max_length {
+        if beams.is_empty() {
+            break;
+        }
+        let mut all_candidates: Vec<BeamHypothesis> = Vec::new();
+
+        for hypo in &beams {
+            let (mut logits, present_cache) =
+                run_decoder_step(model, hypo, &encoder_hidden_states, &encoder_mask_array)?;
+
+            logits = apply_repetition_penalty(logits, &hypo.tokens, config.repetition_penalty);
+            let log_probs = log_softmax_1d(&logits);
+
+            let mut top_candidates: Vec<(u32, f32)> = log_probs
+                .iter()
+                .enumerate()
+                .map(|(id, &lp)| (id as u32, lp))
+                .collect();
+            top_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            // The "k" in top-k is the beam width for beam search
+            top_candidates.truncate(num_beams);
+
+            for (token_id, token_log_prob) in top_candidates {
+                let mut new_tokens = hypo.tokens.clone();
+                new_tokens.push(token_id);
+                all_candidates.push(BeamHypothesis {
+                    tokens: new_tokens,
+                    score: hypo.score + token_log_prob,
+                    cache: Some(present_cache.clone()),
+                });
+            }
+        }
+
+        all_candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        beams.clear();
+        for candidate in all_candidates {
+            if candidate.tokens.last().cloned() == Some(eos_token_id) {
+                if candidate.tokens.len() - 1 >= min_length {
+                    completed_beams.push(candidate);
+                }
+            } else {
+                beams.push(candidate);
+            }
+            if beams.len() == num_beams {
+                break;
+            }
+        }
+    }
+
+    // --- 4. Select Best Hypothesis with Length Penalty ---
+    let mut final_hypotheses = if completed_beams.is_empty() {
+        beams
+    } else {
+        completed_beams
+    };
+
+    // Apply length penalty to find the best hypothesis
+    final_hypotheses.sort_by(|a, b| {
+        let score_a = a.score / (a.tokens.len() as f32).powf(length_penalty);
+        let score_b = b.score / (b.tokens.len() as f32).powf(length_penalty);
+        score_b.partial_cmp(&score_a).unwrap()
+    });
+
+    let best_hypo = final_hypotheses
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No hypothesis generated"))?;
+
+    let generated_tokens = &best_hypo.tokens[1..]; // Exclude BOS token
+
+    tokenizer
+        .decode(generated_tokens, true)
+        .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))
+}
+
+fn run_decoder_step(
+    model: &BartModel,
+    hypo: &BeamHypothesis,
+    encoder_hidden_states: &Array3<f32>,
+    encoder_mask_array: &Array2<f32>,
+) -> Result<(Array1<f32>, FullCache)> {
+    let last_token_id = *hypo.tokens.last().unwrap();
+    let mut decoder_input_array = Array2::<f32>::zeros((1, 1));
+    decoder_input_array[[0, 0]] = last_token_id as f32;
+
+    let past_len = hypo.tokens.len() - 1;
+    let decoder_embeddings = model.embed(&decoder_input_array, true, past_len);
+
+    // --- THE FIX: Create a simple mask for the single-step decoder ---
+    // The query length is 1, and the key length is the total sequence length.
+    // The mask must be all ones to allow the new token to attend to everything.
+    let attention_mask_shape = (1, past_len + 1);
+    let causal_mask = Array2::ones(attention_mask_shape);
+
+    let (decoder_output, present_cache) = model.decoder.forward(
+        decoder_embeddings,
+        encoder_hidden_states,
+        Some(&causal_mask),
+        encoder_mask_array,
+        hypo.cache.as_ref(),
+    )?;
+
+    let last_token_hidden_state = decoder_output.slice(s![0, -1, ..]);
+    let logits = model.lm_head.dot(&last_token_hidden_state);
+
+    Ok((logits, present_cache))
+}
+
+// --- Helper Functions ---
+fn create_decoder_causal_mask(seq_len: usize) -> Array2<f32> {
+    let mut mask = Array2::<f32>::zeros((seq_len, seq_len));
+    for i in 0..seq_len {
+        for j in 0..=i {
+            mask[[i, j]] = 1.0;
+        }
+    }
+    mask
+}
+
+fn log_softmax_1d(logits: &Array1<f32>) -> Array1<f32> {
+    let max_val = logits.fold(f32::NEG_INFINITY, |acc, &x| acc.max(x));
+    let scaled_logits = logits - max_val;
+    let exp_sum = scaled_logits.mapv(f32::exp).sum();
+    scaled_logits - exp_sum.ln()
+}
+
+fn apply_repetition_penalty(
+    mut logits: Array1<f32>,
+    generated_ids: &[u32],
+    penalty: f32,
+) -> Array1<f32> {
+    if penalty == 1.0 {
+        return logits;
+    }
+    for &id in generated_ids {
+        let idx = id as usize;
+        if logits[idx] < 0.0 {
+            logits[idx] *= penalty;
+        } else {
+            logits[idx] /= penalty;
+        }
+    }
+    logits
+}
+
+pub fn generate_encoder_decoder1(
+    model: &BartModel,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    config: &GenerationConfig,
+) -> Result<String> {
+    let input_encoding = tokenizer
+        .encode(prompt, false)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+
+    // Manually add BOS and EOS tokens to the input sequence
+    let mut input_ids_vec = Vec::with_capacity(input_encoding.len() + 2);
+    input_ids_vec.push(model.config.bos_token_id); // Add BOS at the start
+    input_ids_vec.extend(input_encoding.get_ids());
+    input_ids_vec.push(model.config.eos_token_id); // Add EOS at the end
+
+    let attention_mask_vec = vec![1; input_ids_vec.len()];
+
+    let batch_size = 1;
+    let seq_len = input_ids_vec.len();
+
+    let mut input_ids_array = Array2::<f32>::zeros((batch_size, seq_len));
+    let mut encoder_mask_array = Array2::<f32>::zeros((batch_size, seq_len));
+
+    for (j, (&id, &mask_val)) in input_ids_vec
+        .iter()
+        .zip(attention_mask_vec.iter())
+        .enumerate()
+    {
+        input_ids_array[[0, j]] = id as f32;
+        encoder_mask_array[[0, j]] = mask_val as f32;
+    }
+
+    // --- 1. INPUT ---
+    println!("--- 1. RUST INPUT ---");
+    println!("Input IDs: {:?}", input_ids_vec);
+    println!("Attention Mask: {:?}", attention_mask_vec);
+    println!("{}", "-".repeat(20));
+
+    // --- 2. ENCODER EMBEDDINGS ---
+    let encoder_embeddings = model.embed(&input_ids_array, false, 0);
+    println!("\n--- 2. RUST ENCODER EMBEDDINGS ---");
+    println!("Shape: {:?}", encoder_embeddings.dim());
+    println!(
+        "First vector (first 5 values): {:?}",
+        encoder_embeddings.slice(s![0, 0, ..5])
+    );
+    println!("{}", "-".repeat(20));
+
+    // --- 3. ENCODER FINAL OUTPUT ---
+    let encoder_hidden_states = model
+        .encoder
+        .forward(encoder_embeddings, &encoder_mask_array)?;
+    println!("\n--- 3. RUST ENCODER FINAL OUTPUT ---");
+    println!("Shape: {:?}", encoder_hidden_states.dim());
+    println!(
+        "First vector (first 5 values): {:?}",
+        encoder_hidden_states.slice(s![0, 0, ..5])
+    );
+    println!("{}", "-".repeat(20));
+
     let mut decoder_input_ids = vec![model.config.bos_token_id];
-    let mut generated_tokens = vec![];
+    // let mut generated_tokens = vec![];
     let mut past_cache: Option<FullCache> = None;
-
-    // --- 4. Generation Loop ---
-    for step in 0..config.max_new_tokens {
-        let last_token_id = *decoder_input_ids.last().unwrap();
-        let mut decoder_input_array = Array2::<f32>::zeros((1, 1));
-        decoder_input_array[[0, 0]] = last_token_id as f32;
-
-        let past_len = step;
+    // We only need to check the FIRST loop iteration to find the bug.
+    for _ in 0..1 {
+        let current_len = decoder_input_ids.len();
+        let mut decoder_input_array = Array2::<f32>::zeros((batch_size, current_len));
+        for (j, &id) in decoder_input_ids.iter().enumerate() {
+            decoder_input_array[[0, j]] = id as f32;
+        }
+        let mut causal_mask = create_decoder_causal_mask(current_len);
+        println!("DEBUG: Created causal mask: {:?}", causal_mask); // Verify it's correct
+                                                                   // --- 4. DECODER EMBEDDINGS ---
+        let past_len = 0;
         let decoder_embeddings = model.embed(&decoder_input_array, true, past_len);
+        println!("\n--- 4. RUST DECODER EMBEDDINGS (First Step) ---");
+        println!("Shape: {:?}", decoder_embeddings.dim());
+        println!(
+            "First vector (first 5 values): {:?}",
+            decoder_embeddings.slice(s![0, 0, ..5])
+        );
+        println!("{}", "-".repeat(20));
 
-        // --- THE FINAL FIX IS HERE ---
-        // 1. Re-introduce the causal mask creation INSIDE the loop.
-        // Its size must be for the TOTAL sequence length so far (step + 1).
-        let causal_mask = create_decoder_causal_mask(step + 1);
+        // --- 5. DECODER FINAL OUTPUT ---
+        let causal_mask = create_decoder_causal_mask(0 + 1);
 
         // 2. Pass the newly created causal mask to the decoder.
         let (decoder_output, present_cache) = model.decoder.forward(
@@ -229,185 +459,36 @@ pub fn generate_encoder_decoder(
             &encoder_mask_array,
             past_cache.as_ref(),
         )?;
+        println!("\n--- 5. RUST DECODER FINAL OUTPUT (First Step) ---");
+        println!("Shape: {:?}", decoder_output.dim());
+        println!(
+            "First vector (first 5 values): {:?}",
+            decoder_output.slice(s![0, 0, ..5])
+        );
+        println!("{}", "-".repeat(20));
 
-        past_cache = Some(present_cache);
-
-        // --- The rest of the loop remains the same ---
+        // --- 6. FINAL LOGITS ---
         let last_token_hidden_state = decoder_output.slice(s![0, -1, ..]);
-        let mut logits: Array1<f32> = model.lm_head.dot(&last_token_hidden_state);
+        let logits: Array1<f32> = model.lm_head.dot(&last_token_hidden_state);
+        println!("\n--- 6. RUST FINAL LOGITS (First Step) ---");
+        println!("Shape: {:?}", logits.dim());
+        println!("First 10 logit values: {:?}", logits.slice(s![..10]));
+        println!("{}", "-".repeat(20));
 
-        if generated_tokens.len() < min_length {
-            logits[model.config.eos_token_id as usize] = f32::NEG_INFINITY;
-        }
-        
-        println!("\n=== STEP {} ===", step);
-        logits = apply_repetition_penalty(logits, &decoder_input_ids, config.repetition_penalty);
-
-        let mut top_logits: Vec<(usize, f32)> =
-            logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-        top_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        println!("Top 5 logits: {:?}", &top_logits[..5]);
-
+        // For debugging, we don't need to continue the loop.
+        // The code below would run in a real generation.
+        /*
         let next_token_id = sample_token(logits, config)?;
-        println!("Sampled token ID: {}", next_token_id);
-        
-        let token_text = tokenizer.decode(&[next_token_id], false).unwrap_or_default();
-        println!("Token text: '{}'", token_text);
-
-        if next_token_id == model.config.eos_token_id && generated_tokens.len() >= min_length {
-            println!("HIT EOS - STOPPING (after min_length)");
+        if next_token_id == model.config.eos_token_id {
             break;
         }
-
         generated_tokens.push(next_token_id);
         decoder_input_ids.push(next_token_id);
+        */
     }
 
-    // --- 5. Decode and Return ---
-    println!("\nGenerated {} tokens total", generated_tokens.len());
-    println!("Token IDs: {:?}", generated_tokens);
-
-    tokenizer
-        .decode(&generated_tokens, true)
-        .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))
-}
-fn create_decoder_causal_mask(seq_len: usize) -> Array2<f32> {
-    let mut mask = Array2::<f32>::zeros((seq_len, seq_len));
-
-    // Lower triangular: 1 = can attend, 0 = cannot attend
-    for i in 0..seq_len {
-        for j in 0..=i {
-            mask[[i, j]] = 1.0; // Can attend to past and current
-        }
-    }
-    // Upper triangle stays 0 (cannot attend to future)
-
-    mask
-}
-// pub fn generate_encoder_decoder(
-//     model: &BartModel,
-//     tokenizer: &Tokenizer,
-//     prompt: &str,
-//     config: &GenerationConfig,
-// ) -> Result<String> {
-//     let input_encoding = tokenizer
-//         .encode(prompt, false)
-//         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-
-//     // Manually add BOS and EOS tokens to the input sequence
-//     let mut input_ids_vec = Vec::with_capacity(input_encoding.len() + 2);
-//     input_ids_vec.push(model.config.bos_token_id); // Add BOS at the start
-//     input_ids_vec.extend(input_encoding.get_ids());
-//     input_ids_vec.push(model.config.eos_token_id); // Add EOS at the end
-
-//     let attention_mask_vec = vec![1; input_ids_vec.len()];
-
-//     let batch_size = 1;
-//     let seq_len = input_ids_vec.len();
-
-//     let mut input_ids_array = Array2::<f32>::zeros((batch_size, seq_len));
-//     let mut encoder_mask_array = Array2::<f32>::zeros((batch_size, seq_len));
-
-//     for (j, (&id, &mask_val)) in input_ids_vec.iter().zip(attention_mask_vec.iter()).enumerate() {
-//         input_ids_array[[0, j]] = id as f32;
-//         encoder_mask_array[[0, j]] = mask_val as f32;
-//     }
-
-//     // --- 1. INPUT ---
-//     println!("--- 1. RUST INPUT ---");
-//     println!("Input IDs: {:?}", input_ids_vec);
-//     println!("Attention Mask: {:?}", attention_mask_vec);
-//     println!("{}", "-".repeat(20));
-
-//     // --- 2. ENCODER EMBEDDINGS ---
-//     let encoder_embeddings = model.embed(&input_ids_array, false, 0);
-//     println!("\n--- 2. RUST ENCODER EMBEDDINGS ---");
-//     println!("Shape: {:?}", encoder_embeddings.dim());
-//     println!("First vector (first 5 values): {:?}", encoder_embeddings.slice(s![0, 0, ..5]));
-//     println!("{}", "-".repeat(20));
-
-//     // --- 3. ENCODER FINAL OUTPUT ---
-//     let encoder_hidden_states = model.encoder.forward(encoder_embeddings, &encoder_mask_array)?;
-//     println!("\n--- 3. RUST ENCODER FINAL OUTPUT ---");
-//     println!("Shape: {:?}", encoder_hidden_states.dim());
-//     println!("First vector (first 5 values): {:?}", encoder_hidden_states.slice(s![0, 0, ..5]));
-//     println!("{}", "-".repeat(20));
-
-//     let mut decoder_input_ids = vec![model.config.bos_token_id];
-//     // let mut generated_tokens = vec![];
-
-//     // We only need to check the FIRST loop iteration to find the bug.
-//     for _ in 0..1 {
-//         let current_len = decoder_input_ids.len();
-//         let mut decoder_input_array = Array2::<f32>::zeros((batch_size, current_len));
-//         for (j, &id) in decoder_input_ids.iter().enumerate() {
-//             decoder_input_array[[0, j]] = id as f32;
-//         }
-//         let mut causal_mask = create_decoder_causal_mask(current_len);
-//         println!("DEBUG: Created causal mask: {:?}", causal_mask);  // Verify it's correct
-//         // --- 4. DECODER EMBEDDINGS ---
-//         let past_len = 0;
-//         let decoder_embeddings = model.embed(&decoder_input_array, true, past_len);
-//         println!("\n--- 4. RUST DECODER EMBEDDINGS (First Step) ---");
-//         println!("Shape: {:?}", decoder_embeddings.dim());
-//         println!("First vector (first 5 values): {:?}", decoder_embeddings.slice(s![0, 0, ..5]));
-//         println!("{}", "-".repeat(20));
-
-//         // --- 5. DECODER FINAL OUTPUT ---
-//         let decoder_output = model.decoder.forward(
-//             decoder_embeddings,
-//             &encoder_hidden_states,
-//             Some(&causal_mask),
-//             &encoder_mask_array,
-//         )?;
-//         println!("\n--- 5. RUST DECODER FINAL OUTPUT (First Step) ---");
-//         println!("Shape: {:?}", decoder_output.dim());
-//         println!("First vector (first 5 values): {:?}", decoder_output.slice(s![0, 0, ..5]));
-//         println!("{}", "-".repeat(20));
-
-//         // --- 6. FINAL LOGITS ---
-//         let last_token_hidden_state = decoder_output.slice(s![0, -1, ..]);
-//         let logits: Array1<f32> = model.lm_head.dot(&last_token_hidden_state);
-//         println!("\n--- 6. RUST FINAL LOGITS (First Step) ---");
-//         println!("Shape: {:?}", logits.dim());
-//         println!("First 10 logit values: {:?}", logits.slice(s![..10]));
-//         println!("{}", "-".repeat(20));
-
-//         // For debugging, we don't need to continue the loop.
-//         // The code below would run in a real generation.
-//         /*
-//         let next_token_id = sample_token(logits, config)?;
-//         if next_token_id == model.config.eos_token_id {
-//             break;
-//         }
-//         generated_tokens.push(next_token_id);
-//         decoder_input_ids.push(next_token_id);
-//         */
-//     }
-
-//     // Return a placeholder string since we are only debugging the first step.
-//     return Ok("Debugging... check console output.".to_string());
-// }
-/// Apply repetition penalty to logits
-fn apply_repetition_penalty(
-    mut logits: Array1<f32>,
-    generated_ids: &[u32],
-    penalty: f32,
-) -> Array1<f32> {
-    if penalty == 1.0 {
-        return logits;
-    }
-
-    for &id in generated_ids {
-        let idx = id as usize;
-        if logits[idx] < 0.0 {
-            logits[idx] *= penalty;
-        } else {
-            logits[idx] /= penalty;
-        }
-    }
-
-    logits
+    // Return a placeholder string since we are only debugging the first step.
+    return Ok("Debugging... check console output.".to_string());
 }
 
 /// Sample a token from logits

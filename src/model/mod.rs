@@ -14,7 +14,7 @@ pub use distilgpt2::DistilGPT2;
 pub use gpt2::GPT2;
 
 use crate::config::{BartConfig, GPTConfig};
-use crate::generation::{generate_encoder_decoder, generate_text};
+use crate::generation::{generate_encoder_decoder, generate_encoder_decoder1, generate_text};
 use crate::weights::ModelWeights;
 
 #[derive(Debug, Clone, Copy)]
