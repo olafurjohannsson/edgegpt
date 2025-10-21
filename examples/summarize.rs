@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     in human space exploration.";
 
     let config = GenerationConfig {
-    max_new_tokens: 60,
+    max_new_tokens: 100,
     temperature: 1.0,        // Higher temperature for more diversity
     top_k: Some(1),
     top_p: Some(0.9),       // Nucleus sampling
