@@ -13,7 +13,7 @@ pub mod wasm;
 
 // Re-exports
 pub use config::GPTConfig;
-pub use model::{GPTModel, ModelType};
+pub use model::{GenerativeModel, ModelType};
 pub use weights::ModelWeights;
 pub use generation::{GenerationConfig, SamplingStrategy};
 

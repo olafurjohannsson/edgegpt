@@ -14,8 +14,8 @@ use crate::tokenizer::wasm::BPETokenizer as Tokenizer;
 
 /// DistilGPT2 model for text generation
 pub struct DistilGPT2 {
-    base: GPTBase,
-    tokenizer: Tokenizer,
+    pub base: GPTBase,
+    pub tokenizer: Tokenizer,
 }
 
 impl DistilGPT2 {

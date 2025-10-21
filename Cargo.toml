@@ -3,7 +3,7 @@ name = "edgegpt"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ólafur Aron Jóhannsson <olafurjohannss@gmail.com>"]
-description = "Fast GPT inference library for Rust and WASM for text generation on native and edge devices"
+description = "GPT inference library for Rust and WASM for text generation on native and edge devices"
 repository = "https://github.com/olafurjohannssson/edgegpt"
 license = "MIT"
 keywords = ["gpt", "nlp", "wasm", "transformer", "generation"]
@@ -27,7 +27,7 @@ blas-src = { version = "0.10", features = ["openblas"], optional = true }
 openblas-src = { version = "0.10", features = ["cblas", "system"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokenizers = { version = "0.15", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.22.1", default-features = false, features = ["onig"] }
 rayon = "1.11.0"
 dirs = "6.0.0"
 reqwest = { version = "0.12.23", features = ["blocking", "rustls-tls"], default-features = false }

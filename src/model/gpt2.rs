@@ -14,8 +14,8 @@ use crate::tokenizer::wasm::BPETokenizer as Tokenizer;
 
 /// GPT-2 model for text generation
 pub struct GPT2 {
-    base: GPTBase,
-    tokenizer: Tokenizer,
+    pub base: GPTBase,
+    pub tokenizer: Tokenizer,
 }
 
 impl GPT2 {

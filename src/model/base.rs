@@ -53,8 +53,9 @@ impl CausalSelfAttention {
         let head_dim = self.n_embd / self.n_head;
         
         // Compute QKV with single matrix multiplication
-        let qkv = edgetransformers::utils::linear_algebra::matmul_3d_2d(x, &self.c_attn_weight.t().to_owned());
-        let mut qkv = qkv + &self.c_attn_bias;
+        let qkv = edgetransformers::utils::linear_algebra::matmul_3d_2d(x, &self.c_attn_weight);
+
+        let qkv = qkv + &self.c_attn_bias;
         
         // Split into Q, K, V
         let q = qkv.slice(s![.., .., ..self.n_embd]).to_owned();
@@ -111,7 +112,7 @@ impl CausalSelfAttention {
             .to_owned();
         
         // Output projection
-        let mut output = edgetransformers::utils::linear_algebra::matmul_3d_2d(&context, &self.c_proj_weight.t().to_owned());
+        let mut output = edgetransformers::utils::linear_algebra::matmul_3d_2d(&context, &self.c_proj_weight);
         output += &self.c_proj_bias;
         
         Ok((output, (present_k, present_v)))
@@ -167,8 +168,8 @@ pub struct GPTBase {
 impl GPTBase {
     pub fn from_weights(weights: &ModelWeights, config: GPTConfig) -> Result<Self> {
         // Load embeddings
-        let wte = weights.get_array2("wte.weight")?;
-        let wpe = weights.get_array2("wpe.weight")?;
+        let wte = weights.get_array2("transformer.wte.weight")?;
+        let wpe = weights.get_array2("transformer.wpe.weight")?;
         
         // Load transformer blocks
         let mut blocks = Vec::new();
@@ -176,31 +177,31 @@ impl GPTBase {
             let prefix = format!("h.{}", i);
             
             let ln_1 = LayerNorm::new(
-                weights.get_array1(&format!("{}.ln_1.weight", prefix))?,
-                weights.get_array1(&format!("{}.ln_1.bias", prefix))?,
+                weights.get_array1(&format!("transformer.{}.ln_1.weight", prefix))?,
+                weights.get_array1(&format!("transformer.{}.ln_1.bias", prefix))?,
                 config.layer_norm_epsilon,
             );
             
             let attn = CausalSelfAttention::new(
-                weights.get_array2(&format!("{}.attn.c_attn.weight", prefix))?,
-                weights.get_array1(&format!("{}.attn.c_attn.bias", prefix))?,
-                weights.get_array2(&format!("{}.attn.c_proj.weight", prefix))?,
-                weights.get_array1(&format!("{}.attn.c_proj.bias", prefix))?,
+                weights.get_array2(&format!("transformer.{}.attn.c_attn.weight", prefix))?,
+                weights.get_array1(&format!("transformer.{}.attn.c_attn.bias", prefix))?,
+                weights.get_array2(&format!("transformer.{}.attn.c_proj.weight", prefix))?,
+                weights.get_array1(&format!("transformer.{}.attn.c_proj.bias", prefix))?,
                 config.n_head,
                 config.n_embd,
             );
             
             let ln_2 = LayerNorm::new(
-                weights.get_array1(&format!("{}.ln_2.weight", prefix))?,
-                weights.get_array1(&format!("{}.ln_2.bias", prefix))?,
+                weights.get_array1(&format!("transformer.{}.ln_2.weight", prefix))?,
+                weights.get_array1(&format!("transformer.{}.ln_2.bias", prefix))?,
                 config.layer_norm_epsilon,
             );
             
             let mlp = FeedForward::new(
-                weights.get_array2(&format!("{}.mlp.c_fc.weight", prefix))?,
-                weights.get_array1(&format!("{}.mlp.c_fc.bias", prefix))?,
-                weights.get_array2(&format!("{}.mlp.c_proj.weight", prefix))?,
-                weights.get_array1(&format!("{}.mlp.c_proj.bias", prefix))?,
+                weights.get_array2(&format!("transformer.{}.mlp.c_fc.weight", prefix))?,
+                weights.get_array1(&format!("transformer.{}.mlp.c_fc.bias", prefix))?,
+                weights.get_array2(&format!("transformer.{}.mlp.c_proj.weight", prefix))?,
+                weights.get_array1(&format!("transformer.{}.mlp.c_proj.bias", prefix))?,
             );
             
             blocks.push(GPTBlock {
@@ -212,8 +213,8 @@ impl GPTBase {
         }
         
         let ln_f = LayerNorm::new(
-            weights.get_array1("ln_f.weight")?,
-            weights.get_array1("ln_f.bias")?,
+            weights.get_array1("transformer.ln_f.weight")?,
+            weights.get_array1("transformer.ln_f.bias")?,
             config.layer_norm_epsilon,
         );
         
@@ -266,7 +267,7 @@ impl GPTBase {
     }
     
     pub fn get_logits(&self, hidden_states: &Array3<f32>) -> Array3<f32> {
-        // Project to vocabulary (reuse token embeddings as in GPT-2)
+        // Project to vocabulary
         edgetransformers::utils::linear_algebra::matmul_3d_2d(hidden_states, &self.wte.t().to_owned())
     }
 }
